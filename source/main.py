@@ -2,87 +2,78 @@ import numpy as np
 import readfile as rf
 import math
 import random
-import labcor
-import multiprocessing as mp
+import labcor as labcor
 from sklearn import preprocessing as prep
 import warnings
 
 warnings.filterwarnings("ignore")
 
-fold = 10
-datasets = ['emotions']
+# ----------------- Setting Parameters -------------------
 
-ev = labcor.Evaluate()
-criteria = ['hamming_loss', 'accuracy', 'exact_match', 'f1', 'macro_f1', 'micro_f1']
+dataset = 'emotions'     # The name of the dataset
+fold = 10                # total number of folds for cross validation
+k = 0                    # the k-th cross validation
+random_seed = 20         # random seed for cross validation
 
-core_size = 50
-random_seed = 20
+C = 1E-2                 # regulazation parameter for SVC classifier
+max_iter = 1E7           # max iteration for SVC classifier
+imb_rate = 0.05          # the positive rate for define a dimension is balanced / imbalanced
+neg_weight = [0.5, 0.2]  # weight for negative samples in generating self-adapted confidence. 
+                         # the first one is for balanced condition and the second one is for very imbalanced condition. 
+mask_rate = 2            # control the size of mask. 2 is set for better competing.
+map_size = 100           # the size of the matrix which stores the decision pattern along x-axis. the size along y-axis is calculated inside LabCor.
+decay_rate = 10          # the decay rate of the Gauss mask
+slope = 0.5              # the slope of the boundary in the background confidence map.
 
-max_iter = 10 ** 7
+criteria = ['hamming_loss', 'accuracy', 'exact_match', 'f1', 'macro_f1', 'micro_f1'] # criteria used in evaluations
+ev = labcor.Evaluate()   # an object for calculating the criteria
 
-# define training function
-
-def train(x, y, dataset, fold, k):
-
-    # randomly index samples for k-fold cross validation
+# ------------------- Reading Data ----------------------
+# read dataset
+path_x = '../dataset/%s/%s_x.csv' % (dataset, dataset)
+path_y = '../dataset/%s/%s_y.csv' % (dataset, dataset)
+x, x_label = rf.read_csv(path_x)
+y, y_label = rf.read_csv(path_y)
     
-    m = int(math.floor(np.size(x, axis=0) / fold))
-    random.seed(random_seed)
-    indices = np.reshape(random.sample(range(m * fold), m * fold), [fold, m])
+# ------------------ pre-processing ---------------------
+x = prep.scale(x, axis = 0)
+
+# -------- split into training/testing sets -------------
+m = int(math.floor(np.size(x, axis=0) / fold))
+random.seed(random_seed)
+indices = np.reshape(random.sample(range(m * fold), m * fold), [fold, m])
+
+# 2x5 fold
+group_tr = list(range(k, min(k+5, fold))) + list(range(0, k-5))              
+group_te = list(range(k+5, min(k+10, fold))) + list(range(max(0, k-5), k))
     
-    group_tr = list(range(k+1, fold)) + list(range(k))
-    group_te = k
+indice_tr = np.reshape(indices[group_tr], [m * 5])
+indice_te = np.reshape(indices[group_te], [m * 5])
+    
+x_tr = x[indice_tr]
+y_tr = y[indice_tr]
+x_te = x[indice_te]
+y_te = y[indice_te]
         
-    indice_tr = np.reshape(indices[group_tr], [m * (fold - 1)])
-    indice_te = np.reshape(indices[group_te], [m])
+# -------------------- training --------------------------
+clf = labcor.LabCor(
+    max_iter = max_iter, 
+    C = C, 
+    imb_rate = imb_rate,
+    neg_weight = neg_weight,
+    map_size = map_size, 
+    mask_rate = mask_rate, 
+    decay_rate = decay_rate, 
+    slope = slope
+)                        
+  
+# fitting
+clf.fit(x_tr, y_tr)
 
-    x_tr = x[indice_tr]
-    y_tr = y[indice_tr]
-    x_te = x[indice_te]
-    y_te = y[indice_te]
-        
-    # define
-    clf = labcor.LabCor(max_iter=max_iter)
-        
-    # training
-    clf.fit(x_tr, y_tr)
+# ------------------- prediction --------------------------
+# prediction
+y_te_ = clf.predict(x_te)
 
-    # prediction
-    y_te_ = clf.predict(x_te)
-    
-    # evaluation
-    eval_te = ev.evaluator(y_te_, y_te, criteria)
-
-    # output results
-    path = '../result/(dataset=%s) matrics.csv' % (dataset)
-    eval_te = ev.evaluator(y_te_, y_te, criteria)
-    rf.write_csv(path, [[k] + [eval_te[name] for name in criteria]], 'a')
-    print('Finish: dataset %s fold %d' % (dataset, k))
-    
-# define process list
-p_list = []
-
-for dataset in datasets:
-
-    # read dataset
-    path_x = '../dataset/%s/%s_x.csv' % (dataset, dataset)
-    path_y = '../dataset/%s/%s_y.csv' % (dataset, dataset)
-    x, x_label = rf.read_csv(path_x)
-    y, y_label = rf.read_csv(path_y)
-    
-    # pre-processing
-    x = prep.scale(x, axis = 0)
-    
-    # fill process list
-    for k in range(fold):
-        p_list.append(mp.Process(target=train,args=(x, y, dataset, fold, k)))
-
-# run multi-process with a defined core_size
-for batch_number in range(math.ceil(len(p_list) / core_size)):
-        
-    for p in p_list[batch_number * core_size: (batch_number + 1) * core_size]:
-        p.start()
-
-    for p in p_list[batch_number * core_size: (batch_number + 1) * core_size]:
-        p.join()            
-
+# ------------------- evaluation --------------------------
+eval_te = ev.evaluator(y_te_, y_te, criteria)
+print(eval_te)
