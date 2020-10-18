@@ -6,255 +6,256 @@ from scipy import sparse
 from sklearn import svm
 from skmultilearn import problem_transform as pt
 from sklearn import metrics
-from sklearn.svm import SVC
+
+eps = 1E-7
 
 class LabCor:
     
-    def __init__(self, max_iter=5000, meta_mode=2):
+    def __init__(self, max_iter=1E7, meta_mode=2, C=1, map_size=100, imb_rate = 0.05, neg_weight=[0.5, 0.2], mask_rate=2, decay_rate=10, slope=0.5):
         
         self.max_iter = max_iter
         self.meta_mode = meta_mode
-    
+        self.C = C
+        self.imb_rate = imb_rate
+        self.neg_weight_balanced = neg_weight[0]
+        self.neg_weight_imbalanced = neg_weight[1]
+        self.mask_rate = mask_rate
+        self.map_size = map_size
+        self.decay_rate = decay_rate
+        self.slope=slope
+        
     def fit(self, x_tr, y_tr):
         
         y_total_dim = np.size(y_tr, axis=1)
         non_zero_dim = np.sum(y_tr, axis=0) != 0
         y_tr = np.array(y_tr)[:, non_zero_dim]
-        
+        y_dim = np.size(y_tr, axis=1)           # y空间的维度
+        m_tr = np.size(y_tr, axis=0)            # 训练集的数量
         
         # params
         max_iter = self.max_iter
-        meta_mode = self.meta_mode
+        map_size = self.map_size
+        meta_mode = self.meta_mode        
+        imb_rate = self.imb_rate
+        neg_weight_balanced = self.neg_weight_balanced
+        neg_weight_imbalanced = self.neg_weight_imbalanced
+        mask_rate = self.mask_rate
+        decay_rate = self.decay_rate
+        slope = self.slope
         
-        # base classifier
-        pred = pt.BinaryRelevance(svm.LinearSVC(max_iter=max_iter))
+        # slope along x and y direction
+        slope_x = slope / (slope ** 2 + 1) ** (1/2)
+        slope_y = 1 / (slope ** 2 + 1) ** (1/2)
+        # ------------------- training ------------------
+        
+        # train base classifiers
+        br_clf = pt.BinaryRelevance(svm.LinearSVC(max_iter=max_iter, C=self.C))
         x_tr = np.array(x_tr)
         y_tr = np.int32(y_tr)
-        pred.fit(x_tr, y_tr)
-        y_tr_ = sparse.dok_matrix.toarray(pred.predict(x_tr)) # 训练集根据训练结果获得的预测值
+        br_clf.fit(x_tr, y_tr)
+        base_clfs = br_clf.classifiers_
         
-        # meta
-        y_dim = np.size(y_tr, axis=1)           # y空间的维度
-        m_tr = np.size(y_tr, axis=0)            # 训练集的数量
-        m_te = round(m_tr / 9)                  # 假想中测试集数量
-        m_va = 3 * m_te                         # 验证集（确定优化顺序）数量
-        m_vc = m_te                             # 验证集（确定截止位置）数量
-
-        # 分割测试集与验证集
-        x_tr = np.array(x_tr)
-        y_tr = np.array(y_tr)
-        x_vc = np.array(x_tr)[m_va:m_va+m_vc, :]
-        y_vc = np.array(y_tr)[m_va:m_va+m_vc, :]
-        y_vc_ = np.array(y_tr_)[m_va:m_va + m_vc, :]
-        x_va = np.array(x_tr)[0:m_va, :] 
-        y_va = np.array(y_tr)[0:m_va, :]
-        y_va_ = np.array(y_tr_)[0:m_va, :]
-        
-        # 初始化评估参数
-        ev = Evaluate()
-        best_pos_thres = np.ones([y_dim])
-        best_neg_thres = np.zeros([y_dim])
-        best_pos_impro = - np.ones([y_dim])
-        best_neg_impro = - np.ones([y_dim])
-        best_impro = np.zeros([y_dim])
-        
-        thres_pos_list = np.array(range(50, 101)) / 100
-        thres_neg_list = np.array(range(50, -1, -1)) / 100
-
-        classifiers = [None for _ in range(y_dim)]
-
-        # ------------------ 获取每一维度标签矫正的效果 -------------------------------
-
+        # train meta classifiers
+        meta_clfs = [None for _ in range(y_dim)]
         for dim in range(y_dim):
-
-            # 将第dim维的标签作为输出，其他标签作为输入
-            dim_rest = list(range(y_dim))
-            dim_rest.remove(dim)
-
-            # 重组训练集金标准的标签，获得训练结果
+            # expand dimensions
             x = self.generate_meta_x(x_tr, y_tr, dim, mode = meta_mode)
             y = y_tr[:, dim]
-            if sum(y) == 0 or sum(y) == m_tr:
-                continue
-            classifier = SVC(probability=True, kernel='linear', max_iter=max_iter)
-            classifier.fit(x, y)
-            classifiers[dim] = classifier
-
-            # 重组验证集的预测标签（y_va_），根据dim维度以外的标签获取该维度下该标签为1的概率
-            x = self.generate_meta_x(x_va, y_va_, dim, mode = meta_mode)
-            proba = classifier.predict_proba(x)[:, 1] if classifier is not None else 0.5 * np.ones([m_va])
-
-            y_va_adv = y_va_.copy()
-
-            # 扫描确定更改所使用的正阈值（0 -> 1）
-            for thres_pos in thres_pos_list:
-
-                y = [1 if proba[i] > thres_pos else y_va_[i, dim] for i in range(m_va)]
-                imp = ev.improve_function(y_va[:, dim], y_va_[:, dim], y, names = ['single_label_f1', 'single_label_accuracy'])
-                if imp > best_pos_impro[dim]:
-                    best_pos_impro[dim] = imp
-                    best_pos_thres[dim] = thres_pos
-
-            # 扫描确定更改所使用的负阈值（1 -> 0）
-            for thres_neg in thres_neg_list:
-
-                y = [0 if proba[i] < thres_neg else y_va_[i, dim] for i in range(m_va)]
-                imp = ev.improve_function(y_va[:, dim], y_va_[:, dim], y, names = ['single_label_f1', 'single_label_accuracy'])
-                if imp > best_neg_impro[dim]:
-                    best_neg_impro[dim] = imp
-                    best_neg_thres[dim] = thres_neg
-
-            # 取最佳的正负阈值联合确定针对该标签的矫正效果（有时只用到一个阈值）
-            thres_pos = best_pos_thres[dim]
-            thres_neg = best_neg_thres[dim]
-
-            y = y_va_[:, dim].copy()
-
-            y = [1 if proba[i] > thres_pos else y[i] for i in range(m_va)]
-            y = [0 if proba[i] < thres_neg else y[i] for i in range(m_va)]
-
-            best_impro[dim] = ev.improve_function(y_va[:, dim], y_va_[:, dim], y, names = ['single_label_f1', 'single_label_accuracy'])
+            clf = svm.LinearSVC(max_iter=max_iter, C=self.C)
+            clf.fit(x, y)
+            meta_clfs[dim] = clf
+    
+        # --------------- get predictions ----------------
+        # get base predictions
+        base_proba = np.vstack([self.sigmoid(clf.decision_function(x_tr)) for clf in base_clfs]).T
+        base_pred = np.where(base_proba > 0.5, 1, 0)
         
-        # ----------------------- 强标签列表 ----------------------------------
+        # positions for meta predictions
+        meta_proba = np.zeros(base_proba.shape)
+        meta_pred = np.zeros(base_pred.shape)
         
-        strong_dim = np.arange(y_dim)[best_impro == 0]
-
-        # ----------------------- 强标签首先纠正 ----------------------------------
-        
-        y_vc_adv = np.copy(y_vc_)
-
-        for dim in strong_dim:
-
-            thres_pos = best_pos_thres[dim]
-            thres_neg = best_neg_thres[dim]
-            classifier = classifiers[dim]
-
-            # 矫正 y_vc_
-            x = self.generate_meta_x(x_vc, y_vc_, dim, mode = meta_mode)
-            proba = classifier.predict_proba(x)[:, 1] if classifier is not None else 0.5 * np.ones([m_vc])
-            y = y_vc_adv[:, dim]
-            y = [1 if proba[i] > thres_pos else y[i] for i in range(m_vc)]
-            y = [0 if proba[i] < thres_neg else y[i] for i in range(m_vc)]
-            y_vc_adv[:, dim] = y
+        # get meta predictions
+        for dim in range(y_dim):   
             
-        y_vc_ = y_vc_adv
-
-        # ------------------- 根据改进效果确定纠正的顺序 ----------------------------
+            clf = meta_clfs[dim]
+            x = self.generate_meta_x(x_tr, base_pred, dim, mode = meta_mode)
+            proba = self.sigmoid(clf.decision_function(x))
+            meta_proba[:, dim] = proba
         
-        # 提取具有改进效果的维度
-        best_impro_cp = np.copy(best_impro)
-        impro_dim = np.sum(np.where(best_impro > 0, True, False))
-
-        # 确定改进顺序以及用于改进的维度
-        change_sequence = np.zeros(impro_dim)
-        for i in range(impro_dim):
-
-            ind = np.argmax(best_impro_cp)
-            change_sequence[i] = ind
-            best_impro_cp[ind] = 0
-
-        # ------------------------ 对y_vc_进行纠正 ---------------------------------
-
-        # values_list用于记录各参考量的数据情况
-        values_list = [None for _ in range(np.size(change_sequence) + 1)]
-
-        y_vc_ori = np.copy(y_vc_)
-        y_vc_adv = np.copy(y_vc_)
-
-        criteria = ['hamming_loss', 'accuracy', 'exact_match', 'f1', 'macro_f1', 'micro_f1']
-        values_list[0] = ev.improve_function(y_vc, y_vc_ori, y_vc_adv, names = criteria)
-
-        # 逐次纠正适合纠正的各个标签维度
-        for ind in range(np.size(change_sequence)):
-
-            dim = int(change_sequence[ind])
-            dim_rest = list(range(y_dim))
-            dim_rest.remove(dim)
-
-            classifier = classifiers[dim]
-            x = self.generate_meta_x(x_vc, y_vc_adv, dim, mode = meta_mode)
-            proba = classifier.predict_proba(x)[:, 1] if classifier is not None else 0.5 * np.ones([m_vc])
-            thres_pos = best_pos_thres[dim]
-            thres_neg = best_neg_thres[dim]
-            y = y_vc_adv[:, dim]
-            y = [1 if proba[i] > thres_pos else y[i] for i in range(m_vc)]
-            y = [0 if proba[i] < thres_neg else y[i] for i in range(m_vc)]
-
-            y_vc_adv[:, dim] = y
-
-            values_list[ind+1] = ev.improve_function(y_vc, y_vc_ori, y_vc_adv, names = criteria)
-
-        values_list[np.size(change_sequence)] = ev.improve_function(y_vc, y_vc_ori, y_vc_adv, names = criteria)
-        # 确定截止位置
-        cutoff_index = np.argmax(values_list)
+        # 真值
+        true_inds = y_tr > 0.5
+    
+        # ------------- inner validation ----------------
         
+        true_count = np.sum(true_inds, axis=1)
+        lr_min = min(true_count)
+        
+        map_background_list = []
+        map_adapt_list = []
+        
+        map_list = []
+        scale_list = []
+        position_list = []
+        gradient_list = []
+        
+        for dim in range(y_dim):
+            
+            # 坐标变换
+            draw_x = meta_proba[:, dim] - 0.5
+            draw_y = base_proba[:, dim] - meta_proba[:, dim]
+            
+            x_max = max(draw_x)
+            x_min = min(draw_x)
+            x_width = x_max - x_min
+            y_max = max(draw_y)
+            y_min = min(draw_y)
+            y_width = y_max - y_min
+            
+            # calculate a value to balance the scale between x axis and y axis
+            scale = max((np.mean(draw_x ** 2) / (np.mean(draw_y ** 2) + eps)) ** (1/2), 1)
+            scale_list.append(scale)
+            
+            # get the size of the of the map
+            x_size = map_size
+            y_size = int(x_size / x_width * y_width * scale)
+            
+            # get the radius of the Gauss mask
+            gauss_mask_r = np.mean(np.abs(draw_x)) * mask_rate
+            gauss_mask_R = int(gauss_mask_r / x_width * map_size)
+            
+            # create Gauss mask
+            mask_x = mask_y = np.arange(- gauss_mask_R, gauss_mask_R + 1)
+            mask_X, mask_Y = np.meshgrid(mask_x, mask_y)
+            dist = np.sqrt(mask_X ** 2 + mask_Y ** 2)
+            gauss_mask = np.where(dist > gauss_mask_R, 0, np.exp(- decay_rate * dist / gauss_mask_R))
+            
+            # gradient
+            gradient = gauss_mask[int(4 * gauss_mask_R / 5) + 1, gauss_mask_R] - gauss_mask[int(4 * gauss_mask_R / 5), gauss_mask_R]
+            gradient_x = gradient * slope_x
+            gradient_y = gradient * slope_y / scale
+            x_center = int((- x_min / x_width) * x_size) + gauss_mask_R
+            y_center = int((- y_min / y_width) * y_size) + gauss_mask_R
+            gradient_list.append([gradient_x, gradient_y])
+            
+            # draw background confidence map
+            gauss_X, gauss_Y = np.meshgrid(range(x_size + gauss_mask_R * 2), range(y_size + gauss_mask_R * 2))
+            map_background = ((gauss_X - x_center) * gradient_x + (y_center - gauss_Y) * gradient_y).T 
+            map_background_list.append(map_background.copy())
+            
+            # automatically select a weight for the current dimension based on label imbalance condition
+            neg_weight = neg_weight_imbalanced if np.sum(true_inds[:, dim]) / m_tr < imb_rate else neg_weight_balanced
+            
+            # draw self-adapted confidence map
+            map_adapt = np.zeros(map_background.shape)
+            for i, _ in enumerate(draw_x):
+                    
+                    # change from probalistic value into a coordinate on the map
+                    x_position = int(math.floor((draw_x[i] - x_min) / (x_width + eps) * x_size)) + gauss_mask_R
+                    y_position = int(math.floor((draw_y[i] - y_min) / (y_width + eps) * y_size)) + gauss_mask_R
+                    
+                    # add a positive confidence to the surrounding area of a positive sample
+                    if true_inds[i, dim]:
+                        map_adapt[x_position-gauss_mask_R:x_position+gauss_mask_R + 1, 
+                                  y_position-gauss_mask_R:y_position+gauss_mask_R + 1] += gauss_mask * meta_proba[i, dim]
+                    # add a negative confidence to the surrounding area of a negative sample
+                    else:
+                        map_adapt[x_position-gauss_mask_R:x_position+gauss_mask_R + 1, 
+                                  y_position-gauss_mask_R:y_position+gauss_mask_R + 1] -= gauss_mask * neg_weight * (1-meta_proba[i, dim])                     
+            map_adapt_list.append(map_adapt.copy())
+            
+            # the final decision pattern
+            map_list.append(map_adapt + map_background)
+            
+            # store the key values for the affine transformation
+            position_list.append(np.array([x_min, x_width, y_min, y_width, gauss_mask_r, gauss_mask_R, x_size, y_size]))
+            
         self.non_zero_dim = non_zero_dim
-        self.base_clf = pred
         self.y_dim = y_dim
         self.y_total_dim = y_total_dim
-        self.meta_clf = classifiers
-        self.pos_thres = best_pos_thres
-        self.neg_thres = best_neg_thres
-        self.strong_dim = strong_dim
-        self.change_sequence = change_sequence
-        self.cutoff_index = cutoff_index
-    
+        self.br_clf = br_clf
+        self.base_clfs = base_clfs
+        self.meta_clfs = meta_clfs
+        self.map_list = map_list
+        self.map_background_list = map_background_list
+        self.map_adapt_list = map_adapt_list
+        self.scale_list = scale_list
+        self.position_list = position_list
+        self.lr_min = lr_min
+        self.gradient_list = gradient_list
+        
     def predict(self, x_te):
         
         m = np.size(x_te, axis=0)
-
-        # ------------------------ base 获取 ---------------------------------
-        y_base = sparse.dok_matrix.toarray(self.base_clf.predict(x_te))
+        map_list = self.map_list
+        scale_list = self.scale_list
+        position_list = self.position_list
+        gradient_list = self.gradient_list
+        lr_min = self.lr_min
+        y_dim = self.y_dim
         
-        # ------------------------ 强标签矫正 ---------------------------------
+        # ------------------- get base predictions --------------------
+        base_proba = np.vstack([self.sigmoid(clf.decision_function(x_te)) for clf in self.base_clfs]).T
+        base_pred = np.where(base_proba > 0.5, 1, 0)
         
-        y_adv = np.copy(y_base)
+        # ------------------- get meta predictions --------------------
+        meta_proba = np.zeros(base_proba.shape)
+        meta_pred = np.zeros(base_pred.shape)
+        
+        for dim in range(self.y_dim):
 
-        for dim in self.strong_dim:
-
-            thres_pos = self.pos_thres[dim]
-            thres_neg = self.neg_thres[dim]
-            classifier = self.meta_clf[dim]
-
-            # 矫正 y_vc_
-            x = self.generate_meta_x(x_te, y_base, dim, mode = self.meta_mode)
-            proba = classifier.predict_proba(x)[:, 1] if classifier is not None else 0.5 * np.ones([m])
-            y = y_adv[:, dim]
-            y = [1 if proba[i] > thres_pos else y[i] for i in range(m)]
-            y = [0 if proba[i] < thres_neg else y[i] for i in range(m)]
-            y_adv[:, dim] = y
+            clf = self.meta_clfs[dim]
+            x = self.generate_meta_x(x_te, base_pred, dim, mode = self.meta_mode)
+            proba = self.sigmoid(clf.decision_function(x))
+            meta_proba[:, dim] = proba
+        
+        meta_pred = np.where(meta_proba > 0.5, 1, 0)
+        
+        # ------------------ label correction ----------------------------
+        
+        draw_x = meta_proba - 0.5
+        draw_y = base_proba - meta_proba
+        
+        confidence = np.zeros(base_proba.shape)
+        
+        for dim in range(y_dim):
             
-        y_ = y_adv
-        
-        # ------------------------ 弱标签矫正 ---------------------------------
-        
-        y_adv = np.copy(y_)
+            gauss_map = map_list[dim]
+            scale = scale_list[dim]
+            [gradient_x, gradient_y] = gradient_list[dim]
+            [x_min, x_width, y_min, y_width, gauss_mask_r, gauss_mask_R, x_size, y_size] = position_list[dim]
 
-        # 逐次纠正适合纠正的各个标签维度
-        for ind in range(int(self.cutoff_index)):
+            for i, _ in enumerate(draw_x):
+                
+                # get position for each sample
+                x_position = int(math.floor((draw_x[i, dim] - x_min) / (x_width + eps) * x_size) + gauss_mask_R)
+                y_position = int(math.floor((draw_y[i, dim] - y_min) / (y_width + eps) * y_size) + gauss_mask_R)
+                
+                # if the sample is in the region of interest
+                if x_position < gauss_map.shape[0] and x_position >= 0 and y_position < gauss_map.shape[1] and y_position >= 0: 
+                    confidence[i, dim] = gauss_map[x_position, y_position]
+                # if the sample is not in the region of interest
+                else:
+                    confidence[i, dim] = draw_x[i, dim] * gradient_x * x_size / x_width - draw_y[i, dim] * gradient_y * y_size / y_width
+                    
+        predictions = confidence > 0
 
-            dim = int(self.change_sequence[ind])
-            dim_rest = list(range(self.y_dim))
-            dim_rest.remove(dim)
+        # correction based on label count constraint
+        for i, _ in enumerate(predictions):
+             
+            if lr_min > np.sum(predictions[i]):
+                
+                for _ in range(lr_min):
+                    
+                    top_ind = np.argmax(confidence[i])
+                    predictions[i, top_ind] = True
+                    confidence[i, top_ind] = -1E5
+        
+        output = np.zeros([m, self.y_total_dim])
+        output[:, self.non_zero_dim] = predictions
+        
+        return output
 
-            classifier = self.meta_clf[dim]
-            x = self.generate_meta_x(x_te, y_adv, dim, mode = self.meta_mode)
-            proba = classifier.predict_proba(x)[:, 1] if classifier is not None else 0.5 * np.ones([m])
-            thres_pos = self.pos_thres[dim]
-            thres_neg = self.neg_thres[dim]
-            y = y_adv[:, dim]
-            y = [1 if proba[i] > thres_pos else y[i] for i in range(m)]
-            y = [0 if proba[i] < thres_neg else y[i] for i in range(m)]
-
-            y_adv[:, dim] = y     
-        
-        y_ = y_adv
-        
-        y_output = np.zeros([m, self.y_total_dim])
-        y_output[:, self.non_zero_dim] = y_
-        
-        return y_output
-        
+    
     @staticmethod
     def generate_meta_x(x, y, dim, mode = 2):
 
@@ -270,6 +271,10 @@ class LabCor:
             return np.where(y[:, dim_rest] == 1, 1, -1)
         if mode == 4:
             return y[:, dim_rest]
+    
+    @staticmethod
+    def sigmoid(x):
+        return 1.0/(1.0+1.0/np.exp(x))
 
 class Evaluate:
 
@@ -309,16 +314,6 @@ class Evaluate:
 
         return metrics.f1_score(y, y_, average = 'micro')
     
-    @staticmethod
-    def eval_single_label_f1(y, y_):
-
-        return metrics.f1_score(y, y_)
-    
-    @staticmethod
-    def eval_single_label_accuracy(y, y_):
-        
-        return metrics.accuracy_score(y, y_)
-    
     def evaluator(self, y, y_, names):
 
         return {
@@ -328,20 +323,4 @@ class Evaluate:
             'f1': self.eval_f1(y, y_) if 'f1' in names else 0,
             'macro_f1': self.eval_macro_f1(y, y_) if 'macro_f1' in names else 0,
             'micro_f1': self.eval_micro_f1(y, y_) if 'micro_f1' in names else 0,
-            'single_label_f1': self.eval_single_label_f1(y, y_) if 'single_label_f1' in names else 0,
-            'single_label_accuracy': self.eval_single_label_accuracy(y, y_) if 'single_label_accuracy' in names else 0,
         }
-
-    def improve_function(self, y, y_ori, y_adv, names):
-
-        signs = [-1 if name == 'hamming_loss' else 1 for name in names]
-        k = 1
-        
-        values_ori = self.evaluator(y, y_ori, names)
-        values_adv = self.evaluator(y, y_adv, names)
-
-        values_diff = [signs[i] * (values_adv[names[i]] - values_ori[names[i]]) for i in range(len(names))]
-        values_base = [2 * math.sqrt(values_ori[names[i]] * (1 - values_ori[names[i]])) for i in range(len(names))]
-
-        return sum([- math.exp(-k * values_diff[i]) + 1 for i in range(len(names))])
-
